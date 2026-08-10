@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTextEdit, QSizePolicy, QGraphicsDropShadowEffect, QSizeGrip,
     QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox, QSpinBox,
-    QDoubleSpinBox, QPushButton, QTabWidget, QDialogButtonBox, QMessageBox,
+    QDoubleSpinBox, QPushButton, QTabWidget, QListView,
+    QScrollArea,
 )
 
 from config_manager import (
@@ -685,110 +686,182 @@ class NeonTextEdit(QTextEdit):
 
 # ── Main Window ───────────────────────────────────────────────────────────────
 
+
 class SettingsDialog(QDialog):
+    FIELD_HEIGHT = 38
+
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки PySufler")
-        self.setMinimumSize(720, 560)
+        self.setWindowIcon(QIcon(str(ICON_PATH)) if ICON_PATH.exists() else QIcon())
+        self.setMinimumSize(880, 660)
+        self.resize(1020, 800)
         self.settings_result = None
-        self._build_ui(normalize_settings(settings))
+        self._initial_settings = normalize_settings(settings)
+        self._initial_api_key = self._initial_settings.get("openai_api_key", "")
+        self._build_ui(dict(self._initial_settings))
+
+    def show_result_dialog(self, title: str, lines, level="info"):
+        status_colors = {"ok": "#5eead4", "warn": "#fbbf24", "error": "#fca5a5", "info": "#93c5fd"}
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowIcon(QIcon(str(ICON_PATH)) if ICON_PATH.exists() else QIcon())
+        dialog.setMinimumSize(520, 260)
+        dialog.setStyleSheet("""
+            QDialog {
+                background: #060b16;
+                color: #e5e7eb;
+                font-family: "Segoe UI";
+                font-size: 13px;
+            }
+            QWidget#resultCard {
+                background: rgba(13, 23, 41, 0.94);
+                border: 1px solid rgba(56, 189, 248, 0.18);
+                border-radius: 20px;
+            }
+            QLabel#resultTitle {
+                color: #ffffff;
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel { color: #dbeafe; background: transparent; }
+            QLabel[level="ok"] { color: #5eead4; }
+            QLabel[level="warn"] { color: #fbbf24; }
+            QLabel[level="error"] { color: #fca5a5; }
+            QPushButton {
+                min-height: 38px;
+                color: #ffffff;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0e7490, stop:1 #5b21b6);
+                border: 1px solid rgba(103, 232, 249, 0.64);
+                border-radius: 13px;
+                padding: 0 22px;
+                font-weight: 600;
+            }
+        """)
+        root = QVBoxLayout(dialog)
+        root.setContentsMargins(18, 18, 18, 18)
+        card = QWidget()
+        card.setObjectName("resultCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {status_colors.get(level, '#93c5fd')}; background: transparent; font-size: 18px;")
+        header.addWidget(dot)
+        title_label = QLabel(title)
+        title_label.setObjectName("resultTitle")
+        header.addWidget(title_label, 1)
+        layout.addLayout(header)
+        for item in lines:
+            if isinstance(item, tuple):
+                item_level, text = item
+            else:
+                item_level, text = level, str(item)
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setStyleSheet(f"color: {status_colors.get(item_level, '#dbeafe')}; background: transparent;")
+            layout.addWidget(label)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        close_btn = QPushButton("Понятно")
+        close_btn.clicked.connect(dialog.accept)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+        root.addWidget(card)
+        dialog.exec()
 
     def _build_ui(self, settings: dict):
-        self.setStyleSheet("""
-            QDialog { background: #07101f; color: #e5e7eb; }
-            QLabel { color: #cfe4ff; }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-                background: #0f1b2e; color: #e5e7eb; border: 1px solid #27476f;
-                border-radius: 8px; padding: 7px 9px;
-            }
-            QPushButton {
-                background: #13233a; color: #e5e7eb; border: 1px solid #31547d;
-                border-radius: 9px; padding: 8px 12px;
-            }
-            QPushButton:hover { border-color: #38bdf8; background: #17304f; }
-            QTabWidget::pane { border: 1px solid #1f3a5b; border-radius: 10px; }
-            QTabBar::tab {
-                background: #101b2e; color: #94a3b8; padding: 9px 14px;
-                border-top-left-radius: 8px; border-top-right-radius: 8px;
-            }
-            QTabBar::tab:selected { color: #ffffff; background: #18294a; }
-            QCheckBox { color: #dbeafe; spacing: 8px; }
-        """)
-
+        self.setStyleSheet(self._settings_stylesheet())
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(20, 20, 20, 18)
+        root.setSpacing(16)
 
-        title = QLabel(f"Настройки сохраняются в {CONFIG_PATH}")
-        title.setWordWrap(True)
-        title.setStyleSheet("color: #94a3b8;")
-        root.addWidget(title)
+        header = QWidget()
+        header.setObjectName("settingsHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        header_layout.setSpacing(16)
+
+        icon = QLabel()
+        icon.setFixedSize(46, 46)
+        if ICON_PATH.exists():
+            icon.setPixmap(QIcon(str(ICON_PATH)).pixmap(46, 46))
+        header_layout.addWidget(icon)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(4)
+        title = QLabel("Настройки PySufler")
+        title.setObjectName("settingsTitle")
+        subtitle = QLabel("Конфигурация локального помощника")
+        subtitle.setObjectName("settingsSubtitle")
+        path_label = QLabel(self._elide_path(str(CONFIG_PATH)))
+        path_label.setObjectName("settingsPath")
+        path_label.setToolTip(str(CONFIG_PATH))
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        title_col.addWidget(path_label)
+        header_layout.addLayout(title_col, 1)
+        self._soft_shadow(header, blur=34, alpha=70, offset=8)
+        root.addWidget(header)
 
         tabs = QTabWidget()
+        tabs.setObjectName("settingsTabs")
+        tabs.setDocumentMode(False)
         root.addWidget(tabs, 1)
+        self.tabs = tabs
 
-        self.llm_api_type = QComboBox()
-        self.llm_api_type.addItems(["openwebui", "openai", "ollama", "ollama_generate"])
-        self.llm_api_type.setCurrentText(settings["llm_api_type"])
-        self.llm_url = QLineEdit(settings["llm_url"])
-        self.llm_model = QComboBox()
-        self.llm_model.setEditable(True)
-        self.llm_model.addItem(settings["llm_model"])
-        self.llm_model.setCurrentText(settings["llm_model"])
-        self.api_key = QLineEdit(settings["openai_api_key"])
-        self.api_key.setEchoMode(QLineEdit.Password)
+        self.llm_api_type = self._combo(["openwebui", "openai", "ollama", "ollama_generate"], settings["llm_api_type"], 220)
+        self.llm_url = self._line(settings["llm_url"])
+        self.llm_model = self._combo([settings["llm_model"]], settings["llm_model"], 420, editable=True)
+        self.api_key = self._line(settings["openai_api_key"], password=True)
+        self.api_key.setToolTip("")
         self.show_key = QCheckBox("Показать ключ")
         self.show_key.toggled.connect(lambda checked: self.api_key.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password))
-        self.chat_id = QLineEdit(settings["openwebui_chat_id"])
-        self.temperature = QDoubleSpinBox()
-        self.temperature.setRange(0.0, 2.0)
-        self.temperature.setSingleStep(0.1)
-        self.temperature.setValue(float(settings.get("temperature", 0.2)))
-        self.max_tokens = QSpinBox()
-        self.max_tokens.setRange(1, 8192)
-        self.max_tokens.setValue(int(settings.get("max_tokens", 300)))
-        self.llm_timeout = QSpinBox()
-        self.llm_timeout.setRange(5, 1200)
-        self.llm_timeout.setValue(int(settings["llm_timeout"]))
+        self.chat_id = self._line(settings["openwebui_chat_id"])
+        self.temperature = self._double_spin(0.0, 2.0, float(settings.get("temperature", 0.2)), 0.1)
+        self.max_tokens = self._spin(1, 8192, int(settings.get("max_tokens", 300)))
+        self.llm_timeout = self._spin(5, 1200, int(settings["llm_timeout"]))
 
-        llm_tab = QWidget()
-        llm_form = QFormLayout(llm_tab)
-        llm_form.setLabelAlignment(Qt.AlignRight)
-        llm_form.addRow("Тип API", self.llm_api_type)
-        llm_form.addRow("LLM URL", self.llm_url)
-        model_row = QHBoxLayout()
-        model_row.addWidget(self.llm_model, 1)
-        refresh_btn = QPushButton("Обновить модели")
+        refresh_btn = self._button("Обновить модели", "secondary")
         refresh_btn.clicked.connect(self.refresh_models)
+        model_row = QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(10)
+        model_row.addWidget(self.llm_model, 1)
         model_row.addWidget(refresh_btn)
+
+        llm_tab, llm_form = self._form_tab()
+        llm_form.addRow("Тип LLM API", self.llm_api_type)
+        llm_form.addRow("Адрес LLM", self.llm_url)
         llm_form.addRow("Модель", model_row)
-        llm_form.addRow("OPENAI_API_KEY", self.api_key)
+        llm_form.addRow("API-ключ", self.api_key)
         llm_form.addRow("", self.show_key)
         llm_form.addRow("OpenWebUI chat_id", self.chat_id)
-        llm_form.addRow("Temperature", self.temperature)
-        llm_form.addRow("Max tokens", self.max_tokens)
-        llm_form.addRow("Timeout, sec", self.llm_timeout)
+        generation_row = QHBoxLayout()
+        generation_row.setContentsMargins(0, 0, 0, 0)
+        generation_row.setSpacing(12)
+        generation_row.addWidget(self._mini_field("Temperature", self.temperature))
+        generation_row.addWidget(self._mini_field("Max tokens", self.max_tokens))
+        generation_row.addWidget(self._mini_field("Timeout, сек", self.llm_timeout))
+        generation_row.addStretch(1)
+        llm_form.addRow("Параметры генерации", generation_row)
         tabs.addTab(llm_tab, "LLM")
 
-        self.whisper_url = QLineEdit(settings["whisper_url"])
-        self.language = QLineEdit(settings["language"])
-        self.chunk_seconds = QSpinBox()
-        self.chunk_seconds.setRange(1, 60)
-        self.chunk_seconds.setValue(int(settings["chunk_seconds"]))
-        self.buffer_minutes = QSpinBox()
-        self.buffer_minutes.setRange(1, 240)
-        self.buffer_minutes.setValue(int(settings["buffer_minutes"]))
-        whisper_tab = QWidget()
-        whisper_form = QFormLayout(whisper_tab)
-        whisper_form.addRow("Whisper URL", self.whisper_url)
+        self.whisper_url = self._line(settings["whisper_url"])
+        self.language = self._line(settings["language"])
+        self.chunk_seconds = self._spin(1, 60, int(settings["chunk_seconds"]))
+        self.buffer_minutes = self._spin(1, 240, int(settings["buffer_minutes"]))
+        whisper_tab, whisper_form = self._form_tab()
+        whisper_form.addRow("Адрес Whisper", self.whisper_url)
         whisper_form.addRow("Язык", self.language)
-        whisper_form.addRow("Chunk seconds", self.chunk_seconds)
-        whisper_form.addRow("Buffer minutes", self.buffer_minutes)
+        whisper_form.addRow("Длина фрагмента, сек", self.chunk_seconds)
+        whisper_form.addRow("Буфер текста, мин", self.buffer_minutes)
         tabs.addTab(whisper_tab, "Whisper")
 
-        self.input_device = QComboBox()
+        self.input_device = self._combo([], None, 520)
         self.input_device.addItem("Авто", None)
-        self.system_audio_device = QComboBox()
+        self.system_audio_device = self._combo([], None, 520)
         self.system_audio_device.addItem("Авто WASAPI loopback", None)
         self._fill_audio_devices(settings)
         self.system_audio_enabled = QCheckBox("Слушать собеседника")
@@ -797,53 +870,400 @@ class SettingsDialog(QDialog):
         self.auto_system_loopback.setChecked(bool(settings.get("auto_system_loopback", True)))
         self.mix_audio = QCheckBox("Смешивать микрофон + системный звук")
         self.mix_audio.setChecked(bool(settings["mix_mic_and_system_audio"]))
-        audio_tab = QWidget()
-        audio_form = QFormLayout(audio_tab)
+        audio_tab, audio_form = self._form_tab()
         audio_form.addRow("Микрофон", self.input_device)
         audio_form.addRow("", self.system_audio_enabled)
         audio_form.addRow("", self.auto_system_loopback)
-        audio_form.addRow("System audio", self.system_audio_device)
+        audio_form.addRow("Системный звук", self.system_audio_device)
         audio_form.addRow("", self.mix_audio)
-        tabs.addTab(audio_tab, "Audio")
+        tabs.addTab(audio_tab, "Аудио")
 
         self.live_transcription = QCheckBox("Live-распознавание")
         self.live_transcription.setChecked(bool(settings["live_transcription"]))
-        self.live_chunk_seconds = QSpinBox()
-        self.live_chunk_seconds.setRange(1, 20)
-        self.live_chunk_seconds.setValue(int(settings["live_chunk_seconds"]))
-        live_tab = QWidget()
-        live_form = QFormLayout(live_tab)
+        self.live_chunk_seconds = self._spin(1, 20, int(settings["live_chunk_seconds"]))
+        live_tab, live_form = self._form_tab()
         live_form.addRow("", self.live_transcription)
-        live_form.addRow("Live chunk seconds", self.live_chunk_seconds)
-        tabs.addTab(live_tab, "Live")
+        live_form.addRow("Live-фрагмент, сек", self.live_chunk_seconds)
+        tabs.addTab(live_tab, "Live-режим")
 
-        self.hotkey = QLineEdit(settings["hotkey"])
-        self.prompt_mode = QComboBox()
-        self.prompt_mode.addItems(["last", "buffer"])
-        self.prompt_mode.setCurrentText(settings["prompt_mode"])
-        self.last_lines = QSpinBox()
-        self.last_lines.setRange(1, 100)
-        self.last_lines.setValue(int(settings["last_lines"]))
-        advanced_tab = QWidget()
-        advanced_form = QFormLayout(advanced_tab)
-        advanced_form.addRow("Hotkey", self.hotkey)
-        advanced_form.addRow("Prompt mode", self.prompt_mode)
-        advanced_form.addRow("Last lines", self.last_lines)
-        tabs.addTab(advanced_tab, "Advanced")
+        self.hotkey = self._line(settings["hotkey"])
+        self.prompt_mode = self._combo(["last", "buffer"], settings["prompt_mode"], 220)
+        self.last_lines = self._spin(1, 100, int(settings["last_lines"]))
+        advanced_tab, advanced_form = self._form_tab()
+        advanced_form.addRow("Горячая клавиша", self.hotkey)
+        advanced_form.addRow("Режим промпта", self.prompt_mode)
+        advanced_form.addRow("Последних фраз", self.last_lines)
+        tabs.addTab(advanced_tab, "Дополнительно")
 
-        bottom = QHBoxLayout()
-        defaults_btn = QPushButton("По умолчанию")
+        bottom = QWidget()
+        bottom.setObjectName("settingsFooter")
+        bottom_layout = QHBoxLayout(bottom)
+        bottom_layout.setContentsMargins(16, 12, 16, 12)
+        bottom_layout.setSpacing(10)
+        defaults_btn = self._button("По умолчанию", "secondary")
         defaults_btn.clicked.connect(self.restore_defaults)
-        check_btn = QPushButton("Проверить подключение")
+        check_btn = self._button("Проверить подключение", "secondary")
         check_btn.clicked.connect(self.check_connection)
-        bottom.addWidget(defaults_btn)
-        bottom.addWidget(check_btn)
-        bottom.addStretch(1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        bottom.addWidget(buttons)
-        root.addLayout(bottom)
+        save_btn = self._button("Сохранить", "primary")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = self._button("Отмена", "secondary")
+        cancel_btn.clicked.connect(self.reject)
+        bottom_layout.addWidget(defaults_btn)
+        bottom_layout.addWidget(check_btn)
+        bottom_layout.addStretch(1)
+        bottom_layout.addWidget(save_btn)
+        bottom_layout.addWidget(cancel_btn)
+        self._soft_shadow(bottom, blur=26, alpha=48, offset=5)
+        root.addWidget(bottom)
+
+        self._refresh_combo_metrics()
+
+    def _soft_shadow(self, widget: QWidget, blur=28, alpha=55, offset=6):
+        shadow = QGraphicsDropShadowEffect(widget)
+        shadow.setBlurRadius(blur)
+        shadow.setOffset(0, offset)
+        shadow.setColor(QColor(0, 0, 0, alpha))
+        widget.setGraphicsEffect(shadow)
+
+    def _settings_stylesheet(self):
+        return """
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #050b16, stop:0.48 #081120, stop:1 #0c1024);
+                color: #e5e7eb;
+                font-family: "Segoe UI";
+                font-size: 13px;
+            }
+            QTabWidget, QTabBar {
+                background: transparent;
+                border: none;
+            }
+            QTabBar::base {
+                background: transparent;
+                border: none;
+                height: 0px;
+            }
+            QWidget#settingsHeader {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(17, 31, 54, 0.88),
+                    stop:0.55 rgba(15, 27, 50, 0.78),
+                    stop:1 rgba(31, 24, 58, 0.72));
+                border: 1px solid rgba(148, 163, 184, 0.10);
+                border-radius: 20px;
+            }
+            QWidget#settingsFooter {
+                background: rgba(13, 23, 41, 0.58);
+                border: none;
+                border-radius: 18px;
+            }
+            QLabel#settingsTitle {
+                color: #ffffff;
+                font-size: 26px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QLabel#settingsSubtitle {
+                color: #b7c8df;
+                font-size: 14px;
+                background: transparent;
+            }
+            QLabel#settingsPath {
+                color: #7488a8;
+                font-size: 11px;
+                background: transparent;
+            }
+            QLabel { color: #cfe4ff; background: transparent; }
+            QScrollArea, QScrollArea > QWidget > QWidget {
+                background: transparent;
+                border: none;
+            }
+            QWidget#settingsPanel {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(17, 30, 52, 0.74),
+                    stop:0.62 rgba(12, 23, 42, 0.70),
+                    stop:1 rgba(21, 18, 48, 0.62));
+                border: none;
+                border-radius: 24px;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                min-height: 38px;
+                background: rgba(18, 30, 52, 0.72);
+                color: #e5e7eb;
+                border: 1px solid rgba(148, 163, 184, 0.10);
+                border-radius: 14px;
+                padding: 7px 12px;
+                selection-background-color: #2563eb;
+                selection-color: #ffffff;
+                font-size: 13px;
+            }
+            QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+                background: rgba(22, 38, 66, 0.80);
+                border: 1px solid rgba(56, 189, 248, 0.22);
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid rgba(56, 189, 248, 0.48);
+                background: rgba(23, 42, 72, 0.88);
+            }
+            QComboBox::drop-down {
+                width: 30px;
+                border: none;
+                border-left: none;
+                border-top-right-radius: 12px;
+                border-bottom-right-radius: 12px;
+                background: transparent;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid #38bdf8;
+                margin-right: 10px;
+            }
+            QComboBox QAbstractItemView {
+                background: rgba(9, 18, 34, 0.98);
+                color: #e5e7eb;
+                border: 1px solid rgba(56, 189, 248, 0.24);
+                border-radius: 14px;
+                padding: 8px;
+                outline: 0;
+                selection-background-color: rgba(37, 99, 235, 0.52);
+                selection-color: #ffffff;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 30px;
+                padding: 7px 10px;
+                border-radius: 7px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background: rgba(30, 64, 111, 0.68);
+                color: #ffffff;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0e7490, stop:1 #5b21b6);
+                color: #ffffff;
+            }
+            QTabWidget::pane {
+                border: none;
+                border-radius: 22px;
+                background: transparent;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: rgba(17, 31, 54, 0.44);
+                color: #93a8c8;
+                min-height: 36px;
+                padding: 8px 17px;
+                margin-right: 6px;
+                border-radius: 16px;
+                border: none;
+            }
+            QTabBar::tab:hover {
+                color: #e5e7eb;
+                background: rgba(30, 48, 80, 0.68);
+            }
+            QTabBar::tab:selected {
+                color: #ffffff;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(14, 116, 144, 0.86),
+                    stop:1 rgba(91, 33, 182, 0.78));
+            }
+            QCheckBox {
+                color: #dbeafe;
+                spacing: 10px;
+                min-height: 30px;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                border-radius: 10px;
+                border: 1px solid #385a85;
+                background: #101b2e;
+            }
+            QCheckBox::indicator:checked {
+                background: #38bdf8;
+                border: 1px solid #7dd3fc;
+            }
+            QPushButton {
+                min-height: 38px;
+                color: #e5e7eb;
+                background: rgba(26, 42, 68, 0.72);
+                border: 1px solid rgba(148, 163, 184, 0.12);
+                border-radius: 15px;
+                padding: 0 18px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: rgba(37, 57, 90, 0.82);
+                border-color: rgba(56, 189, 248, 0.28);
+            }
+            QPushButton[variant="primary"] {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(14, 116, 144, 0.92),
+                    stop:1 rgba(109, 40, 217, 0.90));
+                border-color: rgba(103, 232, 249, 0.30);
+                color: #ffffff;
+            }
+            QPushButton[variant="primary"]:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(8, 145, 178, 0.98),
+                    stop:1 rgba(124, 58, 237, 0.96));
+            }
+            QSpinBox::up-button, QDoubleSpinBox::up-button,
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                width: 0px;
+                border: none;
+                background: transparent;
+            }
+            QScrollArea QScrollBar:vertical, QComboBox QScrollBar:vertical, QScrollBar:vertical {
+                background: #0a1322;
+                width: 12px;
+                margin: 4px 2px 4px 2px;
+                border-radius: 7px;
+            }
+            QScrollArea QScrollBar::handle:vertical, QComboBox QScrollBar::handle:vertical, QScrollBar::handle:vertical {
+                background: #31547d;
+                min-height: 36px;
+                border-radius: 6px;
+            }
+            QScrollArea QScrollBar::handle:vertical:hover, QComboBox QScrollBar::handle:vertical:hover, QScrollBar::handle:vertical:hover {
+                background: #38bdf8;
+            }
+            QScrollArea QScrollBar::add-page:vertical, QScrollArea QScrollBar::sub-page:vertical,
+            QComboBox QScrollBar::add-page:vertical, QComboBox QScrollBar::sub-page:vertical,
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: #0a1322;
+                border-radius: 7px;
+            }
+            QScrollArea QScrollBar::add-line:vertical, QScrollArea QScrollBar::sub-line:vertical,
+            QComboBox QScrollBar::add-line:vertical, QComboBox QScrollBar::sub-line:vertical,
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+                background: transparent;
+            }
+            QScrollArea QScrollBar:horizontal, QComboBox QScrollBar:horizontal, QScrollBar:horizontal {
+                background: #0a1322;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollArea QScrollBar::handle:horizontal, QComboBox QScrollBar::handle:horizontal, QScrollBar::handle:horizontal {
+                background: #31547d;
+                min-width: 36px;
+                border-radius: 5px;
+            }
+            QToolTip {
+                background: #0b1424;
+                color: #e5e7eb;
+                border: 1px solid #38bdf8;
+                border-radius: 8px;
+                padding: 6px;
+            }
+        """
+
+    def _elide_path(self, value: str) -> str:
+        metrics = QFontMetrics(QFont("Segoe UI", 10))
+        return metrics.elidedText(value, Qt.ElideMiddle, 620)
+
+    def _form_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        panel = QWidget()
+        panel.setObjectName("settingsPanel")
+        self._soft_shadow(panel, blur=24, alpha=42, offset=5)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignTop)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        layout.addLayout(form)
+        layout.addStretch(1)
+        scroll.setWidget(panel)
+        return scroll, form
+
+    def _line(self, value: str, password=False):
+        widget = QLineEdit(value)
+        widget.setMinimumHeight(self.FIELD_HEIGHT)
+        widget.setMinimumWidth(360)
+        widget.setClearButtonEnabled(not password)
+        if password:
+            widget.setEchoMode(QLineEdit.Password)
+        if value and not password:
+            widget.setToolTip(value)
+        return widget
+
+    def _combo(self, items, current, minimum_width=260, editable=False):
+        combo = QComboBox()
+        combo.setEditable(editable)
+        combo.setMinimumHeight(self.FIELD_HEIGHT)
+        combo.setMinimumWidth(minimum_width)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(24)
+        view = QListView(combo)
+        view.setObjectName("comboPopup")
+        view.setUniformItemSizes(False)
+        view.setVerticalScrollMode(QListView.ScrollPerPixel)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        combo.setView(view)
+        combo.setMaxVisibleItems(14)
+        for item in items:
+            combo.addItem(str(item), item)
+        if current is not None:
+            combo.setCurrentText(str(current))
+        combo.currentTextChanged.connect(lambda text, c=combo: c.setToolTip(text))
+        combo.setToolTip(combo.currentText())
+        return combo
+
+    def _spin(self, minimum, maximum, value):
+        widget = QSpinBox()
+        widget.setRange(minimum, maximum)
+        widget.setValue(value)
+        widget.setButtonSymbols(QSpinBox.NoButtons)
+        widget.setMinimumHeight(self.FIELD_HEIGHT)
+        widget.setMinimumWidth(180)
+        return widget
+
+    def _double_spin(self, minimum, maximum, value, step):
+        widget = QDoubleSpinBox()
+        widget.setRange(minimum, maximum)
+        widget.setSingleStep(step)
+        widget.setDecimals(2)
+        widget.setValue(value)
+        widget.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        widget.setMinimumHeight(self.FIELD_HEIGHT)
+        widget.setMinimumWidth(180)
+        return widget
+
+    def _button(self, text: str, variant="secondary"):
+        btn = QPushButton(text)
+        btn.setProperty("variant", variant)
+        btn.setMinimumHeight(self.FIELD_HEIGHT)
+        btn.setCursor(QCursor(Qt.PointingHandCursor))
+        return btn
+
+    def _mini_field(self, label: str, widget: QWidget):
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        caption = QLabel(label)
+        caption.setStyleSheet("color: #8fa8c7; font-size: 11px; background: transparent;")
+        layout.addWidget(caption)
+        layout.addWidget(widget)
+        return box
+
+    def _refresh_combo_metrics(self):
+        for combo in self.findChildren(QComboBox):
+            metrics = combo.fontMetrics()
+            longest = max([metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())] or [combo.minimumWidth()])
+            width = max(combo.minimumWidth(), min(longest + 90, 900))
+            combo.view().setMinimumWidth(width)
+            for i in range(combo.count()):
+                text = combo.itemText(i)
+                combo.setItemData(i, text, Qt.ToolTipRole)
 
     def _fill_audio_devices(self, settings: dict):
         try:
@@ -872,14 +1292,18 @@ class SettingsDialog(QDialog):
                     pa.terminate()
             except Exception:
                 pass
+        self._refresh_combo_metrics()
 
     def _collect(self) -> dict:
+        api_key = self.api_key.text().strip()
+        if not api_key and self._initial_api_key:
+            api_key = self._initial_api_key
         return normalize_settings({
             "whisper_url": self.whisper_url.text().strip(),
             "llm_url": self.llm_url.text().strip(),
             "llm_api_type": self.llm_api_type.currentText().strip().lower(),
             "llm_model": self.llm_model.currentText().strip(),
-            "openai_api_key": self.api_key.text().strip(),
+            "openai_api_key": api_key,
             "openwebui_chat_id": self.chat_id.text().strip() or "meeting-helper",
             "hotkey": self.hotkey.text().strip() or "ctrl+alt+a",
             "chunk_seconds": self.chunk_seconds.value(),
@@ -902,21 +1326,30 @@ class SettingsDialog(QDialog):
     def restore_defaults(self):
         self.settings_result = normalize_settings(DEFAULT_SETTINGS)
         save_config(self.settings_result)
-        QMessageBox.information(self, "PySufler", "Настройки сброшены к безопасным значениям по умолчанию.")
+        self.show_result_dialog("PySufler", [("ok", "Настройки сброшены к безопасным значениям по умолчанию.")], "ok")
         self.accept()
 
     def refresh_models(self):
+        current = self.llm_model.currentText().strip()
         try:
             models = self._request_models()
         except Exception as exc:
-            QMessageBox.warning(self, "PySufler", f"Не удалось получить модели:\n{exc}")
+            self.show_result_dialog("Не удалось получить модели", [("error", str(exc))], "error")
             return
-        current = self.llm_model.currentText()
         self.llm_model.clear()
+        if current and current not in models:
+            self.llm_model.addItem(current)
         for model in models:
             self.llm_model.addItem(model)
         if current:
             self.llm_model.setCurrentText(current)
+            if current not in models:
+                self.show_result_dialog(
+                    "Модель сохранена",
+                    [("warn", "Текущей модели нет в новом списке. Значение сохранено.")],
+                    "warn",
+                )
+        self._refresh_combo_metrics()
 
     def _request_models(self):
         settings = self._collect()
@@ -948,15 +1381,17 @@ class SettingsDialog(QDialog):
         lines = []
         try:
             models = self._request_models()
-            lines.append(f"LLM: OK, моделей найдено: {len(models)}")
+            lines.append(("ok", f"LLM: OK, моделей найдено: {len(models)}"))
         except Exception as exc:
-            lines.append(f"LLM: ошибка: {exc}")
+            lines.append(("error", f"LLM: ошибка: {exc}"))
         try:
             response = requests.get(self.whisper_url.text().strip(), timeout=5)
-            lines.append(f"Whisper endpoint: HTTP {response.status_code}")
+            status = "ok" if response.status_code < 500 else "warn"
+            lines.append((status, f"Whisper endpoint: HTTP {response.status_code}"))
         except Exception as exc:
-            lines.append(f"Whisper endpoint: {exc}")
-        QMessageBox.information(self, "Проверка подключения", "\n".join(lines))
+            lines.append(("error", f"Whisper endpoint: {exc}"))
+        level = "error" if any(item[0] == "error" for item in lines) else "ok"
+        self.show_result_dialog("Проверка подключения", lines, level)
 
     def accept(self):
         if self.settings_result is None:

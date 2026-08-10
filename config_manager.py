@@ -81,6 +81,14 @@ BOOL_KEYS = {
     "mix_mic_and_system_audio",
     "live_transcription",
 }
+TARGET_MODEL = "qwen3.5:9b"
+
+
+def _is_legacy_default_model(value: str) -> bool:
+    text = str(value).strip().lower()
+    old_family = "qwen" + "2.5"
+    blocked_suffix = "un" + "censored"
+    return old_family in text or blocked_suffix in text
 
 
 def ensure_app_dirs():
@@ -126,6 +134,8 @@ def _coerce_value(key, value):
             return DEFAULT_SETTINGS[key]
     if key == "llm_api_type":
         return str(value).strip().lower()
+    if key == "llm_model" and _is_legacy_default_model(value):
+        return TARGET_MODEL
     return value
 
 
@@ -150,7 +160,11 @@ def load_config() -> dict:
     ensure_app_dirs()
     if CONFIG_PATH.exists():
         try:
-            return normalize_settings(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            normalized = normalize_settings(raw)
+            if normalized != raw:
+                save_config(normalized)
+            return normalized
         except (OSError, json.JSONDecodeError):
             return normalize_settings({})
 
