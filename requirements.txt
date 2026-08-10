@@ -1,0 +1,8 @@
+requests
+sounddevice
+numpy
+scipy
+keyboard
+python-dotenv
+PySide6
+pyaudiowpatch

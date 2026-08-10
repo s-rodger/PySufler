@@ -1,0 +1,50 @@
+# Local configuration and secrets
+.env
+.env.*
+!/.env.example
+config.json
+*.key
+*.pem
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Runtime data
+transcript.txt
+suggestions.txt
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+
+# Logs and diagnostics
+logs/
+*.log
+whisper_live_debug.log
+meeting_helper_restart.log
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Local shortcuts and OS files
+*.lnk
+Thumbs.db
+Desktop.ini
+
+# Backups and temporary files
+*.bak
+*.backup
+*.old
+*.tmp
+*.temp
+*~
