@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 
 a = Analysis(
     ['meeting_helper_modern_gui.py'],
@@ -33,6 +35,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['meeting_helper.ico'],
+    version='version_info.txt',
 )
 coll = COLLECT(
     exe,
@@ -43,3 +46,9 @@ coll = COLLECT(
     upx_exclude=[],
     name='PySufler',
 )
+
+target_dir = Path(DISTPATH) / 'PySufler' / '_internal'
+# PyInstaller can collect an unrelated ICU 78 from the build machine. PySide6
+# uses the Windows system ICU; the unrelated DLL breaks QtCore at startup.
+for incompatible_icu in ('icuuc.dll', 'icudt78.dll'):
+    (target_dir / incompatible_icu).unlink(missing_ok=True)

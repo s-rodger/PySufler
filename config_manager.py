@@ -1,3 +1,5 @@
+import base64
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -6,10 +8,14 @@ from dotenv import dotenv_values
 
 
 APP_NAME = "PySufler"
+APP_VERSION = "0.1.2"
 APP_DIR = Path(os.getenv("APPDATA", Path.home())) / APP_NAME
 DATA_DIR = APP_DIR / "data"
 LOGS_DIR = APP_DIR / "logs"
 CONFIG_PATH = APP_DIR / "config.json"
+SECRET_PATH = APP_DIR / "secrets.json"
+HISTORY_FILENAMES = ("transcript.txt", "suggestions.txt")
+LEGACY_PRIVATE_LOGS = ("whisper_live_debug.log",)
 
 
 DEFAULT_SETTINGS = {
@@ -18,7 +24,7 @@ DEFAULT_SETTINGS = {
     "llm_api_type": "openwebui",
     "llm_model": "qwen3.5:9b",
     "openai_api_key": "",
-    "openwebui_chat_id": "meeting-helper",
+    "openwebui_chat_id": "",
     "hotkey": "ctrl+alt+a",
     "chunk_seconds": 8,
     "buffer_minutes": 10,
@@ -29,12 +35,14 @@ DEFAULT_SETTINGS = {
     "llm_timeout": 90,
     "temperature": 0.2,
     "max_tokens": 300,
-    "system_audio_enabled": True,
+    "system_audio_enabled": False,
     "system_audio_device": None,
     "auto_system_loopback": True,
     "mix_mic_and_system_audio": True,
     "live_transcription": True,
     "live_chunk_seconds": 2,
+    "save_history": False,
+    "diagnostic_mode": False,
 }
 
 
@@ -61,6 +69,8 @@ ENV_TO_CONFIG = {
     "MIX_MIC_AND_SYSTEM_AUDIO": "mix_mic_and_system_audio",
     "LIVE_TRANSCRIPTION": "live_transcription",
     "LIVE_CHUNK_SECONDS": "live_chunk_seconds",
+    "SAVE_HISTORY": "save_history",
+    "DIAGNOSTIC_MODE": "diagnostic_mode",
 }
 
 
@@ -80,6 +90,8 @@ BOOL_KEYS = {
     "auto_system_loopback",
     "mix_mic_and_system_audio",
     "live_transcription",
+    "save_history",
+    "diagnostic_mode",
 }
 TARGET_MODEL = "qwen3.5:9b"
 
@@ -105,6 +117,89 @@ def data_path(filename: str) -> Path:
 def log_path(filename: str) -> Path:
     ensure_app_dirs()
     return LOGS_DIR / filename
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def _blob(data: bytes):
+    buffer = ctypes.create_string_buffer(data)
+    return _DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))), buffer
+
+
+def _dpapi_protect(value: str) -> str:
+    if os.name != "nt":
+        raise OSError("Windows DPAPI недоступен")
+    source, source_buffer = _blob(value.encode("utf-8"))
+    target = _DataBlob()
+    if not ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(source), ctypes.c_wchar_p("PySufler API key"), None, None, None, 0x01, ctypes.byref(target)
+    ):
+        raise ctypes.WinError()
+    try:
+        encrypted = ctypes.string_at(target.pbData, target.cbData)
+        return base64.b64encode(encrypted).decode("ascii")
+    finally:
+        ctypes.windll.kernel32.LocalFree(target.pbData)
+        del source_buffer
+
+
+def _dpapi_unprotect(value: str) -> str:
+    if os.name != "nt":
+        return ""
+    source, source_buffer = _blob(base64.b64decode(value))
+    target = _DataBlob()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(source), None, None, None, None, 0x01, ctypes.byref(target)
+    ):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(target.pbData, target.cbData).decode("utf-8")
+    finally:
+        ctypes.windll.kernel32.LocalFree(target.pbData)
+        del source_buffer
+
+
+def _load_protected_api_key() -> str:
+    if os.name != "nt" or not SECRET_PATH.exists():
+        return ""
+    try:
+        payload = json.loads(SECRET_PATH.read_text(encoding="utf-8"))
+        return _dpapi_unprotect(str(payload.get("openai_api_key_dpapi") or ""))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+
+
+def _save_protected_api_key(value: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        encrypted = _dpapi_protect(value)
+        SECRET_PATH.write_text(
+            json.dumps({"openai_api_key_dpapi": encrypted}, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
+
+
+def local_history_paths() -> tuple[Path, ...]:
+    return tuple(DATA_DIR / name for name in HISTORY_FILENAMES) + tuple(
+        LOGS_DIR / name for name in LEGACY_PRIVATE_LOGS
+    )
+
+
+def delete_local_history() -> int:
+    removed = 0
+    for path in local_history_paths():
+        try:
+            path.unlink(missing_ok=False)
+            removed += 1
+        except FileNotFoundError:
+            pass
+    return removed
 
 
 def _to_bool(value):
@@ -162,9 +257,19 @@ def load_config() -> dict:
         try:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             normalized = normalize_settings(raw)
-            if normalized != raw:
-                save_config(normalized)
-            return normalized
+            plaintext_key = str(normalized.get("openai_api_key") or "")
+            protected_key = "" if plaintext_key else _load_protected_api_key()
+            runtime = dict(normalized)
+            runtime["openai_api_key"] = plaintext_key or protected_key
+            persisted = dict(normalized)
+            persisted["openai_api_key"] = ""
+            if plaintext_key or persisted != raw:
+                try:
+                    save_config(runtime)
+                except OSError:
+                    # Keep the existing file intact if DPAPI is temporarily unavailable.
+                    pass
+            return runtime
         except (OSError, json.JSONDecodeError):
             return normalize_settings({})
 
@@ -176,8 +281,19 @@ def load_config() -> dict:
 def save_config(settings: dict) -> dict:
     ensure_app_dirs()
     normalized = normalize_settings(settings)
+    persisted = dict(normalized)
+    api_key = str(normalized.get("openai_api_key") or "")
+    if api_key and os.name == "nt":
+        if not _save_protected_api_key(api_key):
+            raise OSError("Не удалось защитить API-ключ через Windows DPAPI")
+        persisted["openai_api_key"] = ""
+    elif not api_key and os.name == "nt":
+        try:
+            SECRET_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
     CONFIG_PATH.write_text(
-        json.dumps(normalized, ensure_ascii=False, indent=2),
+        json.dumps(persisted, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return normalized

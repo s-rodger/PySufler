@@ -15,8 +15,12 @@ if errorlevel 1 goto fail
   --windowed ^
   --name PySufler ^
   --icon meeting_helper.ico ^
+  --version-file version_info.txt ^
   --add-data "meeting_helper.ico;." ^
   meeting_helper_modern_gui.py
+if errorlevel 1 goto fail
+
+"%PYTHON_EXE%" -c "from pathlib import Path; d=Path(r'dist\PySufler\_internal'); [(d/n).unlink(missing_ok=True) for n in ('icuuc.dll','icudt78.dll')]"
 if errorlevel 1 goto fail
 
 echo.

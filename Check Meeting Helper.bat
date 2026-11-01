@@ -6,12 +6,12 @@ set "PYTHON_EXE=python.exe"
 if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
 
 echo Checking PySufler Python files...
-"%PYTHON_EXE%" -m py_compile meeting_helper.py meeting_helper_modern_gui.py test_transcription_merge.py
+"%PYTHON_EXE%" -m py_compile meeting_helper.py meeting_helper_modern_gui.py test_transcription_merge.py test_privacy_settings.py
 if errorlevel 1 goto fail
 
 echo.
 echo Running unit tests...
-"%PYTHON_EXE%" -m unittest test_transcription_merge.py -v
+"%PYTHON_EXE%" -m unittest test_transcription_merge.py test_privacy_settings.py -v
 if errorlevel 1 goto fail
 
 echo.

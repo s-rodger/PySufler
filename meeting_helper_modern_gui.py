@@ -19,7 +19,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor, QPainter, QPainterPath, QLinearGradient, QRadialGradient,
     QFont, QFontMetrics, QPen, QBrush, QCursor, QClipboard, QTextCursor,
-    QIcon, QPixmap,
+    QIcon, QPixmap, QFontDatabase,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -31,14 +31,15 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import (
+    APP_VERSION,
     CONFIG_PATH,
     DEFAULT_SETTINGS,
+    delete_local_history,
     log_path,
     normalize_settings,
     save_config,
 )
 from meeting_helper import (
-    append_line,
     audio_to_wav_bytes,
     build_llm_request,
     ConversationHistory,
@@ -48,6 +49,7 @@ from meeting_helper import (
     parse_llm_response,
     record_system_audio_loopback,
     resample_audio,
+    save_history_entry,
 )
 
 SAMPLE_RATE = 16000
@@ -55,6 +57,11 @@ CHANNELS = 1
 APP_NAME = "PySufler"
 APP_DISPLAY_NAME = "PySufler — Суфлёр совещаний"
 APP_ID = "PySufler"
+
+
+def system_font_family():
+    families = QFontDatabase.families()
+    return next((name for name in ("Segoe UI Variable", "Segoe UI") if name in families), QApplication.font().family())
 PROJECT_DIR = Path(__file__).resolve().parent
 ICON_PATH = PROJECT_DIR / "meeting_helper.ico"
 
@@ -75,7 +82,7 @@ RED       = QColor(251, 79, 122)
 RED_DIM   = QColor(90, 20, 40)
 
 STATUS_BG = QColor(8, 15, 30)
-LIVE_DEBUG_LOG = log_path("whisper_live_debug.log")
+DIAGNOSTIC_LOG = log_path("diagnostics.log")
 
 
 def env_bool(name, default=False):
@@ -164,14 +171,24 @@ def merge_transcription_chunks(existing: str, new_chunk: str) -> str:
     return f"{existing} {tail}".strip() if tail else existing
 
 
-def log_live_whisper_debug(raw_response: str, extracted: str, cleaned: str, merged: str):
+def log_whisper_diagnostic(enabled: bool, event: str, **metrics):
+    """Write technical metadata only; conversation content is never logged."""
+    if not enabled:
+        return
     try:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(LIVE_DEBUG_LOG, "a", encoding="utf-8") as fh:
-            fh.write(f"[{stamp}] raw_response={raw_response!r}\n")
-            fh.write(f"[{stamp}] extracted_text={extracted!r}\n")
-            fh.write(f"[{stamp}] cleaned_text={cleaned!r}\n")
-            fh.write(f"[{stamp}] merged_text={merged!r}\n\n")
+        allowed = {
+            "raw_bytes", "extracted_chars", "cleaned_chars", "merged_chars",
+            "status_code", "error_type",
+        }
+        safe_metrics = " ".join(
+            f"{key}={value}"
+            for key, value in metrics.items()
+            if key in allowed
+            and (isinstance(value, (bool, int, float)) or (isinstance(value, str) and len(value) <= 40))
+        )
+        with open(DIAGNOSTIC_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] event={event} {safe_metrics}\n".rstrip() + "\n")
     except OSError:
         pass
 
@@ -295,11 +312,14 @@ class RingIcon(QWidget):
 class NeonButton(QWidget):
     clicked = Signal()
 
-    def __init__(self, text, accent: QColor, dim: QColor, parent=None):
+    def __init__(self, text, accent: QColor, dim: QColor, parent=None, icon_kind=None):
         super().__init__(parent)
         self.setFixedSize(188, 54)
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self._text   = text
+        self._icon_kind = icon_kind
+        self.setAccessibleName(text)
+        self.setFocusPolicy(Qt.StrongFocus)
         self._accent = accent
         self._dim    = dim
         self._glow   = 0.0      # 0..1
@@ -313,6 +333,7 @@ class NeonButton(QWidget):
     def configure(self, **kw):
         if "text" in kw:
             self._text = kw["text"]
+            self.setAccessibleName(self._text)
         if "fg_color" in kw:
             c = kw["fg_color"]
             if isinstance(c, str):
@@ -345,9 +366,19 @@ class NeonButton(QWidget):
         if e.button() == Qt.LeftButton:
             self.clicked.emit()
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            if not event.isAutoRepeat():
+                self.clicked.emit()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.45)
         w, h, r = self.width(), self.height(), 16
 
         # Outer glow halo
@@ -379,12 +410,50 @@ class NeonButton(QWidget):
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(QRectF(2, 2, w - 4, h - 4), r, r)
+        if self.hasFocus():
+            p.setPen(QPen(TEXT, 1, Qt.DotLine))
+            p.drawRoundedRect(QRectF(6, 6, w - 12, h - 12), r - 4, r - 4)
 
         # Text
         p.setPen(TEXT)
-        font = QFont("Segoe UI", 14, QFont.Bold)
+        font = QFont(system_font_family(), 12, QFont.Bold)
         p.setFont(font)
-        p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, self._text)
+        text_rect = QRectF(0, 0, w, h)
+        if self._icon_kind:
+            text_width = QFontMetrics(font).horizontalAdvance(self._text)
+            left = (w - text_width - 26) / 2
+            if not self._text:
+                left = (w - 14) / 2
+            p.setPen(QPen(TEXT, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            if self._icon_kind == "record":
+                if self._text.strip() == "Стоп":
+                    p.fillRect(QRectF(left, h / 2 - 6, 12, 12), RED)
+                else:
+                    p.setBrush(CYAN)
+                    p.drawEllipse(QPointF(left + 6, h / 2), 5, 5)
+            elif self._icon_kind == "check":
+                p.drawLine(QPointF(left, h / 2), QPointF(left + 5, h / 2 + 5))
+                p.drawLine(QPointF(left + 5, h / 2 + 5), QPointF(left + 14, h / 2 - 5))
+            elif self._icon_kind == "answer":
+                path = QPainterPath(QPointF(left + 9, h / 2 - 9))
+                for x, y in ((0, 2), (6, 2), (4, 9), (15, -3), (8, -3)):
+                    path.lineTo(left + x, h / 2 + y)
+                path.closeSubpath()
+                p.drawPath(path)
+            elif self._icon_kind == "clear":
+                p.drawRoundedRect(QRectF(left + 2, h / 2 - 4, 10, 12), 2, 2)
+                p.drawLine(QPointF(left, h / 2 - 6), QPointF(left + 14, h / 2 - 6))
+                p.drawLine(QPointF(left + 5, h / 2 - 9), QPointF(left + 9, h / 2 - 9))
+            elif self._icon_kind == "settings":
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QPointF(left + 7, h / 2), 5, 5)
+                p.drawEllipse(QPointF(left + 7, h / 2), 1.5, 1.5)
+                for i in range(8):
+                    a = i * math.pi / 4
+                    p.drawLine(QPointF(left + 7 + 6 * math.cos(a), h / 2 + 6 * math.sin(a)),
+                               QPointF(left + 7 + 8 * math.cos(a), h / 2 + 8 * math.sin(a)))
+            text_rect = QRectF(left + 26, 0, text_width + 2, h)
+        p.drawText(text_rect, Qt.AlignCenter, self._text)
         p.end()
 
 
@@ -641,7 +710,7 @@ class SoftComboBox(QComboBox):
                 border: none;
                 outline: none;
                 padding: 2px;
-                font-family: "Roboto", "Segoe UI", Arial;
+                font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
             QListWidget#softComboList::item {
@@ -889,8 +958,11 @@ class SettingsDialog(QDialog):
         self._initial_settings = normalize_settings(settings)
         self._initial_api_key = self._initial_settings.get("openai_api_key", "")
         self._build_ui(dict(self._initial_settings))
+        available = QApplication.primaryScreen().availableGeometry()
+        self.setMinimumSize(760, 420)
+        self.resize(min(1020, available.width() - 32), min(800, available.height() - 32))
 
-    def show_result_dialog(self, title: str, lines, level="info"):
+    def show_result_dialog(self, title: str, lines, level="info", confirm_text=""):
         status_colors = {"ok": "#5eead4", "warn": "#fbbf24", "error": "#fca5a5", "info": "#93c5fd"}
         dialog = QDialog(self)
         dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -902,7 +974,7 @@ class SettingsDialog(QDialog):
             QDialog {
                 background: transparent;
                 color: #e5e7eb;
-                font-family: "Roboto", "Segoe UI", Arial;
+                font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
             QWidget#resultCard {
@@ -960,6 +1032,16 @@ class SettingsDialog(QDialog):
         title_label.setObjectName("resultTitle")
         header.addWidget(title_label, 1)
         layout.addLayout(header)
+        messages = QWidget()
+        messages_layout = QVBoxLayout(messages)
+        messages_layout.setContentsMargins(0, 0, 0, 0)
+        messages_layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
+        messages_scroll = QScrollArea()
+        messages_scroll.setWidgetResizable(True)
+        messages_scroll.setFrameShape(QFrame.NoFrame)
+        messages_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        messages_scroll.setWidget(messages)
+        layout.addWidget(messages_scroll, 1)
         for item in lines:
             if isinstance(item, tuple):
                 item_level, text = item
@@ -977,15 +1059,25 @@ class SettingsDialog(QDialog):
             label.setWordWrap(True)
             label.setStyleSheet(f"color: {status_colors.get(item_level, '#dbeafe')}; background: transparent;")
             row.addWidget(label, 1)
-            layout.addLayout(row)
+            messages_layout.addLayout(row)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        close_btn = QPushButton("Закрыть")
-        close_btn.clicked.connect(dialog.accept)
-        buttons.addWidget(close_btn)
+        if confirm_text:
+            cancel_btn = QPushButton("Отмена")
+            cancel_btn.clicked.connect(dialog.reject)
+            buttons.addWidget(cancel_btn)
+            confirm_btn = QPushButton(confirm_text)
+            confirm_btn.clicked.connect(dialog.accept)
+            buttons.addWidget(confirm_btn)
+        else:
+            close_btn = QPushButton("Закрыть")
+            close_btn.clicked.connect(dialog.accept)
+            buttons.addWidget(close_btn)
         layout.addLayout(buttons)
         root.addWidget(card)
-        dialog.exec()
+        available = QApplication.primaryScreen().availableGeometry()
+        dialog.resize(min(680, available.width() - 32), min(480, available.height() - 32))
+        return dialog.exec() == QDialog.Accepted
 
     def _build_ui(self, settings: dict):
         self.setStyleSheet(self._settings_stylesheet())
@@ -1016,7 +1108,7 @@ class SettingsDialog(QDialog):
 
         sidebar = QWidget()
         sidebar.setObjectName("settingsSidebar")
-        sidebar.setFixedWidth(210)
+        sidebar.setFixedWidth(180)
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(12, 12, 12, 12)
         sidebar_layout.setSpacing(8)
@@ -1052,10 +1144,12 @@ class SettingsDialog(QDialog):
         self.llm_url = self._line(settings["llm_url"])
         self.llm_model = self._combo([settings["llm_model"]], settings["llm_model"], 230, editable=False)
         self.llm_model.setMaximumWidth(270)
-        self.api_key = self._line(settings["openai_api_key"], password=True)
-        self.api_key.setToolTip("")
-        self.show_key, show_key_row = self._toggle_row("Показать ключ", False)
-        self.show_key.toggled.connect(lambda checked: self.api_key.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password))
+        self.api_key = self._line("", password=True)
+        self.api_key.setPlaceholderText(
+            "Защищённый ключ сохранён — введите новый для замены"
+            if self._initial_api_key else "Введите API-ключ"
+        )
+        self.api_key.setToolTip("Сохранённое значение не отображается.")
         self.chat_id = self._line(settings["openwebui_chat_id"])
         self.temperature = self._double_spin(0.0, 2.0, float(settings.get("temperature", 0.2)), 0.1)
         self.max_tokens = self._spin(1, 8192, int(settings.get("max_tokens", 300)))
@@ -1071,10 +1165,16 @@ class SettingsDialog(QDialog):
         model_row.addWidget(self.llm_model, 1)
         model_row.addWidget(refresh_btn)
 
+        if not settings["system_audio_enabled"]:
+            audio_summary = "микрофон"
+        elif settings["mix_mic_and_system_audio"]:
+            audio_summary = "микрофон + системный звук"
+        else:
+            audio_summary = "системный звук"
         overview = self._section_page("Основные", "Краткая сводка локального помощника и быстрые действия.")
-        overview.addWidget(self._info_card("PySufler — Суфлёр совещаний", "Локальное приложение для записи микрофона и системного звука, live-распознавания и коротких ответов через локальную LLM."))
+        overview.addWidget(self._info_card("PySufler — Суфлёр совещаний", f"Версия {APP_VERSION}. Локальное приложение для записи микрофона и системного звука, live-распознавания и коротких ответов через локальную LLM."))
         overview.addWidget(self._status_card("Текущая модель", settings["llm_model"], "LLM"))
-        overview.addWidget(self._status_card("Режим звука", "микрофон + системный звук" if settings["mix_mic_and_system_audio"] else "микрофон", "Audio"))
+        overview.addWidget(self._status_card("Режим звука", audio_summary, "Audio"))
         instruction_btn = self._button("Открыть инструкцию", "secondary")
         instruction_btn.clicked.connect(lambda: self._switch_section(7))
         overview.addWidget(instruction_btn)
@@ -1086,9 +1186,8 @@ class SettingsDialog(QDialog):
             self._setting_row("Тип API", "Формат локального LLM endpoint.", self.llm_api_type),
             self._setting_row("Адрес LLM", "OpenWebUI, OpenAI-compatible или Ollama endpoint.", self.llm_url),
             self._setting_row("Модель", "Текущая целевая модель сохраняется при обновлении списка.", model_row),
-            self._setting_row("API-ключ", "Используется только локально и не выводится в логи.", self.api_key),
-            self._setting_row("Показать API-ключ", "Временно раскрыть значение поля ключа.", show_key_row),
-            self._setting_row("OpenWebUI chat_id", "Обязательный идентификатор чата для OpenWebUI.", self.chat_id),
+            self._setting_row("API-ключ", "Хранится через Windows DPAPI и никогда не отображается повторно.", self.api_key),
+            self._setting_row("OpenWebUI chat_id", "Необязательно. Оставьте пустым для обычных запросов; иначе нужен ID существующего чата.", self.chat_id),
         ]))
         generation_row = QHBoxLayout()
         generation_row.setContentsMargins(0, 0, 0, 0)
@@ -1100,6 +1199,7 @@ class SettingsDialog(QDialog):
         llm_page.addWidget(self._group("Генерация", [
             self._setting_row("Параметры", "Температура, лимит ответа и timeout запроса.", generation_row),
         ]))
+        llm_page.addWidget(self._info_card("Передача данных", "В LLM отправляются текущий текст и до пяти предыдущих пар вопрос–ответ. Для адресов вне этого компьютера используйте HTTPS."))
         llm_page.addWidget(self.model_status)
         llm_page.addStretch(1)
         self._add_page("llm", "Модель и LLM", llm_page)
@@ -1115,6 +1215,7 @@ class SettingsDialog(QDialog):
             self._setting_row("Длина фрагмента", "Размер аудио-куска для фонового режима, сек.", self.chunk_seconds),
             self._setting_row("Буфер текста", "Сколько минут текста держать в памяти.", self.buffer_minutes),
         ]))
+        whisper_page.addWidget(self._info_card("Передача аудио", "Whisper получает WAV с выбранных источников. Для удалённого или сетевого endpoint используйте HTTPS."))
         whisper_page.addStretch(1)
         self._add_page("whisper", "Whisper", whisper_page)
 
@@ -1161,16 +1262,23 @@ class SettingsDialog(QDialog):
         self.hotkey = self._line(settings["hotkey"])
         self.prompt_mode = self._combo(["last", "buffer"], settings["prompt_mode"], 220)
         self.last_lines = self._spin(1, 100, int(settings["last_lines"]))
+        self.save_history = ToggleSwitch(bool(settings.get("save_history", False)))
+        self.diagnostic_mode = ToggleSwitch(bool(settings.get("diagnostic_mode", False)))
         advanced_page = self._section_page("Дополнительно", "Горячая клавиша, режим промпта и локальные каталоги.")
         open_config_btn = self._button("Открыть папку конфигурации", "secondary")
         open_config_btn.clicked.connect(self._open_config_folder)
+        delete_history_btn = self._button("Удалить локальную историю", "secondary")
+        delete_history_btn.clicked.connect(self._delete_local_history)
         advanced_page.addWidget(self._group("Поведение", [
             self._setting_row("Горячая клавиша", "Команда для консольного режима meeting_helper.py.", self.hotkey),
             self._setting_row("Режим промпта", "last отправляет последние фразы, buffer — весь буфер.", self.prompt_mode),
             self._setting_row("Последних фраз", "Количество непустых фраз для режима last.", self.last_lines),
         ]))
         advanced_page.addWidget(self._group("Данные", [
+            self._setting_row("Сохранять историю", "Записывать transcript.txt и suggestions.txt. По умолчанию выключено.", self._switch_control(self.save_history)),
+            self._setting_row("Диагностика", "Записывать только технические метрики без текста разговоров.", self._switch_control(self.diagnostic_mode)),
             self._setting_row("Конфигурация", self._elide_path(str(CONFIG_PATH)), open_config_btn),
+            self._setting_row("Локальная история", "Удаляет сохранённые расшифровки, ответы и старый приватный debug-log.", delete_history_btn),
         ]))
         advanced_page.addStretch(1)
         self._add_page("advanced", "Дополнительно", advanced_page)
@@ -1229,6 +1337,8 @@ class SettingsDialog(QDialog):
         scroll = QScrollArea()
         scroll.setObjectName("settingsPageScroll")
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content_layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
         scroll.setWidget(page)
         index = self.stack.addWidget(scroll)
 
@@ -1351,9 +1461,11 @@ class SettingsDialog(QDialog):
         label_box.setSpacing(2)
         title_label = QLabel(title)
         title_label.setObjectName("settingsRowTitle")
+        title_label.setWordWrap(True)
         hint_label = QLabel(hint)
         hint_label.setObjectName("settingsRowHint")
         hint_label.setWordWrap(True)
+        hint_label.setMinimumWidth(0)
         label_box.addWidget(title_label)
         label_box.addWidget(hint_label)
         layout.addLayout(label_box, 1)
@@ -1405,6 +1517,9 @@ class SettingsDialog(QDialog):
         text_label = QLabel(text)
         text_label.setObjectName("settingsInfoText")
         text_label.setWordWrap(True)
+        text_label.setMinimumWidth(0)
+        text_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
         layout.addWidget(title_label)
         layout.addWidget(text_label)
         return card
@@ -1452,7 +1567,7 @@ class SettingsDialog(QDialog):
             QDialog {
                 background: transparent;
                 color: #e5e7eb;
-                font-family: "Roboto", "Segoe UI", Arial;
+                font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
             QWidget#settingsShell {
@@ -1820,11 +1935,13 @@ class SettingsDialog(QDialog):
         return btn
 
     def _mini_field(self, label: str, widget: QWidget):
+        widget.setMinimumWidth(70)
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         caption = QLabel(label)
+        caption.setWordWrap(True)
         caption.setStyleSheet("color: #8fa8c7; font-size: 11px; background: transparent;")
         layout.addWidget(caption)
         layout.addWidget(widget)
@@ -1877,7 +1994,7 @@ class SettingsDialog(QDialog):
             "llm_api_type": self.llm_api_type.currentText().strip().lower(),
             "llm_model": self.llm_model.currentText().strip(),
             "openai_api_key": api_key,
-            "openwebui_chat_id": self.chat_id.text().strip() or "meeting-helper",
+            "openwebui_chat_id": self.chat_id.text().strip(),
             "hotkey": self.hotkey.text().strip() or "ctrl+alt+a",
             "chunk_seconds": self.chunk_seconds.value(),
             "buffer_minutes": self.buffer_minutes.value(),
@@ -1894,7 +2011,25 @@ class SettingsDialog(QDialog):
             "mix_mic_and_system_audio": self.mix_audio.isChecked(),
             "live_transcription": self.live_transcription.isChecked(),
             "live_chunk_seconds": self.live_chunk_seconds.value(),
+            "save_history": self.save_history.isChecked(),
+            "diagnostic_mode": self.diagnostic_mode.isChecked(),
         })
+
+    def _delete_local_history(self):
+        confirmed = self.show_result_dialog(
+            "Удалить локальную историю?",
+            [("warn", "Будут удалены сохранённые расшифровки, ответы и старый приватный debug-log. Отменить действие после подтверждения нельзя.")],
+            "warn",
+            confirm_text="Удалить",
+        )
+        if not confirmed:
+            return
+        removed = delete_local_history()
+        self.show_result_dialog(
+            "Локальная история",
+            [("ok", f"Удалено файлов: {removed}." if removed else "Сохранённая история не найдена.")],
+            "ok",
+        )
 
     def restore_defaults(self):
         self.settings_result = normalize_settings(DEFAULT_SETTINGS)
@@ -1992,8 +2127,23 @@ class SettingsDialog(QDialog):
     def accept(self):
         if self.settings_result is None:
             self.settings_result = self._collect()
-            save_config(self.settings_result)
+            try:
+                save_config(self.settings_result)
+            except OSError:
+                self.settings_result = None
+                self.show_result_dialog("Не удалось сохранить настройки", [("error", "Проверьте доступ к локальной папке и Windows DPAPI. Старые настройки сохранены.")], "error")
+                return
         super().accept()
+
+
+class MainScrollArea(QScrollArea):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        content = self.widget()
+        if content is not None and content.layout() is not None:
+            content.resize(self.viewport().width(), max(
+                self.viewport().height(), content.layout().minimumSize().height()
+            ))
 
 
 class ModernMeetingHelperGui(QWidget):
@@ -2009,15 +2159,12 @@ class ModernMeetingHelperGui(QWidget):
         self.setWindowTitle(APP_NAME)
         screen = QApplication.primaryScreen()
         available = screen.availableGeometry() if screen else QRect(0, 0, 1200, 950)
-        start_w = min(1200, max(1050, available.width() - 80))
-        start_h = min(950, max(760, available.height() - 80))
-        min_h = 740 if start_h < 840 else 800
+        start_w = min(1200, max(680, available.width() - 40))
+        start_h = min(950, max(480, available.height() - 40))
         self.resize(start_w, start_h)
-        self.setMinimumSize(1050, min_h)
+        self.setMinimumSize(680, 480)
 
         self.settings = load_settings()
-        self.settings["system_audio_enabled"] = env_bool("SYSTEM_AUDIO_ENABLED", True)
-        self.settings["mix_mic_and_system_audio"] = env_bool("MIX_MIC_AND_SYSTEM_AUDIO", True)
 
         self.stream = None
         self.system_stream = None
@@ -2075,7 +2222,19 @@ class ModernMeetingHelperGui(QWidget):
         content = QWidget()
         content.setObjectName("content")
         content.setStyleSheet("QWidget#content { background: transparent; }")
-        outer.addWidget(content)
+        scroll = MainScrollArea()
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(False)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
+            QScrollBar:vertical { background: transparent; width: 6px; margin: 4px 0; }
+            QScrollBar::handle:vertical { background: #304c6b; min-height: 28px; border-radius: 3px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
         vbox = QVBoxLayout(content)
         vbox.setContentsMargins(22, 20, 22, 16)
@@ -2091,7 +2250,7 @@ class ModernMeetingHelperGui(QWidget):
     def _label(self, text, size=13, bold=False, color=None):
         lbl = QLabel(text)
         w = QFont.Bold if bold else QFont.Normal
-        lbl.setFont(QFont("Segoe UI", size, w))
+        lbl.setFont(QFont(system_font_family(), size, w))
         col = color or TEXT
         lbl.setStyleSheet(f"color: {col.name()}; background: transparent;")
         return lbl
@@ -2105,16 +2264,20 @@ class ModernMeetingHelperGui(QWidget):
 
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
-        title_col.addWidget(self._label(APP_DISPLAY_NAME, 30, True))
-        title_col.addWidget(self._label("локальный помощник PySufler для быстрых ответов", 13,
-                                        color=QColor("#8aabcc")))
+        title = self._label(APP_NAME, 24, True)
+        title.setWordWrap(True)
+        title_col.addWidget(title)
+        subtitle = self._label("Суфлёр совещаний · локальный помощник", 11, color=QColor("#8aabcc"))
+        subtitle.setWordWrap(True)
+        title_col.addWidget(subtitle)
         self.model_label = self._label(f"Модель: {self.settings['llm_model']}", 10,
                                        color=QColor("#6f8fb1"))
         title_col.addWidget(self.model_label)
-        row.addLayout(title_col)
-        row.addStretch()
+        row.addLayout(title_col, 1)
 
-        self.settings_btn = NeonButton("⚙", QColor(70, 110, 155), QColor(10, 18, 36))
+        self.settings_btn = NeonButton("", QColor(70, 110, 155), QColor(10, 18, 36), icon_kind="settings")
+        self.settings_btn.setAccessibleName("Настройки")
+        self.settings_btn.setToolTip("Настройки")
         self.settings_btn.set_size(42, 30)
         self.settings_btn.clicked.connect(self.open_settings)
         row.addWidget(self.settings_btn)
@@ -2133,23 +2296,27 @@ class ModernMeetingHelperGui(QWidget):
         row = QHBoxLayout()
         row.setSpacing(10)
 
-        self.listen_btn = NeonButton("◉  Запись", CYAN, CYAN_DIM)
-        self.listen_btn.set_size(190, 54)
+        self.listen_btn = NeonButton("Запись", CYAN, CYAN_DIM, icon_kind="record")
+        self.listen_btn.setMinimumSize(130, 48)
+        self.listen_btn.setMaximumSize(16777215, 48)
         self.listen_btn.clicked.connect(self.toggle_recording)
         row.addWidget(self.listen_btn)
 
-        self.answer_btn = NeonButton("⚡  Ответ", PURPLE, PURPLE_DIM)
-        self.answer_btn.set_size(170, 54)
+        self.answer_btn = NeonButton("Ответ", PURPLE, PURPLE_DIM, icon_kind="answer")
+        self.answer_btn.setMinimumSize(120, 48)
+        self.answer_btn.setMaximumSize(16777215, 48)
         self.answer_btn.clicked.connect(self.request_answer)
         row.addWidget(self.answer_btn)
 
-        self.clear_btn = NeonButton("◌  Очистить", QColor(58, 80, 112), QColor(16, 28, 50))
-        self.clear_btn.set_size(155, 54)
+        self.clear_btn = NeonButton("Очистить", QColor(58, 80, 112), QColor(16, 28, 50), icon_kind="clear")
+        self.clear_btn.setMinimumSize(120, 48)
+        self.clear_btn.setMaximumSize(16777215, 48)
         self.clear_btn.clicked.connect(self.clear_fields)
         row.addWidget(self.clear_btn)
 
-        self.check_btn = NeonButton("✓  Проверить", QColor(68, 96, 130), QColor(14, 26, 46))
-        self.check_btn.set_size(145, 54)
+        self.check_btn = NeonButton("Проверить", QColor(68, 96, 130), QColor(14, 26, 46), icon_kind="check")
+        self.check_btn.setMinimumSize(130, 48)
+        self.check_btn.setMaximumSize(16777215, 48)
         self.check_btn.clicked.connect(self.run_diagnostics)
         row.addWidget(self.check_btn)
 
@@ -2166,9 +2333,8 @@ class ModernMeetingHelperGui(QWidget):
         toggle_row.addWidget(self._label("Слушать собеседника", 12))
         toggle_col.addLayout(toggle_row)
         toggle_col.addWidget(self._label("микрофон + звук системы", 10, color=MUTED))
-        row.addLayout(toggle_col)
-
         vbox.addLayout(row)
+        vbox.addLayout(toggle_col)
 
     def _build_config_bar(self, vbox):
         label = self._label(f"Модель: {self.settings['llm_model']}", 11,
@@ -2177,6 +2343,14 @@ class ModernMeetingHelperGui(QWidget):
         vbox.addWidget(label)
 
     def _build_question_card(self, vbox):
+        sources = QHBoxLayout()
+        sources.setSpacing(18)
+        self.mic_indicator = self._label("MIC · Выключен", 11, color=MUTED)
+        self.sys_indicator = self._label("SYS · Выключен", 11, color=MUTED)
+        sources.addWidget(self.mic_indicator)
+        sources.addWidget(self.sys_indicator)
+        sources.addStretch()
+        vbox.addLayout(sources)
         card = GlassCard(CYAN)
         cl = QVBoxLayout(card)
         cl.setContentsMargins(28, 18, 28, 18)
@@ -2383,7 +2557,10 @@ class ModernMeetingHelperGui(QWidget):
     # ── Status ────────────────────────────────────────────────────────────────
 
     def set_status(self, text: str):
+        self.status_lbl.setToolTip(text)
         self.status_lbl.setText(text)
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setMinimumWidth(0)
         if text.startswith("Ошибка"):
             self.status_dot.set_color(RED)
         elif text in (
@@ -2410,6 +2587,7 @@ class ModernMeetingHelperGui(QWidget):
         self.set_status(f"Ошибка: {text[:90]}")
 
     def _update_timer(self):
+        self._refresh_source_indicators()
         self._btn_phase = (self._btn_phase + 0.12) % (math.pi * 2)
         if self.is_recording and self.recording_started_at is not None:
             elapsed = int(time.time() - self.recording_started_at)
@@ -2432,8 +2610,12 @@ class ModernMeetingHelperGui(QWidget):
         self._refresh_mode_label()
 
     def _refresh_mode_label(self):
-        mode = ("микрофон + звук системы"
-                if self.settings["system_audio_enabled"] else "микрофон")
+        if not self.settings["system_audio_enabled"]:
+            mode = "микрофон"
+        elif self.settings.get("mix_mic_and_system_audio", True):
+            mode = "микрофон + звук системы"
+        else:
+            mode = "звук системы"
         n = len(self.conversation_history)
         ctx = f"  ·  Контекст: {n} сообщ." if n > 0 else ""
         self.mode_lbl.setText(f"Режим: {mode}{ctx}")
@@ -2462,6 +2644,16 @@ class ModernMeetingHelperGui(QWidget):
             self.start_recording()
 
     def start_recording(self):
+        if self.stream is not None or self.system_stream is not None:
+            try:
+                self._close_audio_streams()
+            except Exception:
+                self.set_error("предыдущий аудиопоток ещё завершается")
+                return
+        self._recording_id = getattr(self, "_recording_id", 0) + 1
+        self._recording_stop = threading.Event()
+        self._mic_signal_at = 0.0
+        self._sys_signal_at = 0.0
         with self.frames_lock:
             self.frames = []
             self.full_frames = []
@@ -2469,7 +2661,6 @@ class ModernMeetingHelperGui(QWidget):
             self.system_frames = []
             self.full_system_frames = []
         self.settings["system_audio_enabled"] = self.toggle.isChecked()
-        self.settings["mix_mic_and_system_audio"] = env_bool("MIX_MIC_AND_SYSTEM_AUDIO", True)
         self.system_audio_active = False
         self.system_audio_seen = False
         self.system_audio_has_signal = False
@@ -2488,6 +2679,7 @@ class ModernMeetingHelperGui(QWidget):
             return
 
         self.is_recording = True
+        self.toggle.setEnabled(False)
         self.recording_started_at = time.time()
         self._last_live_text = ""
 
@@ -2504,7 +2696,7 @@ class ModernMeetingHelperGui(QWidget):
                 system_warning = f"Звук системы недоступен, слушаю микрофон: {str(exc)[:60]}"
 
         self.listen_btn.configure(
-            text="■  Стоп",
+            text="Стоп",
             fg_color=QColor(74, 20, 40),
             border_color=RED,
         )
@@ -2515,11 +2707,13 @@ class ModernMeetingHelperGui(QWidget):
 
         if self.settings.get("live_transcription", False):
             threading.Thread(target=self._live_transcription_worker,
-                             daemon=True).start()
+                             args=(self._recording_id, self._recording_stop), daemon=True).start()
 
     def audio_callback(self, indata, frames, time_info, status):
+        if indata.size and np.max(np.abs(indata.astype(np.int32))) > 120:
+            self._mic_signal_at = time.monotonic()
         if status:
-            QTimer.singleShot(0, lambda: self.set_status(f"Предупреждение аудио: {status}"))
+            _bridge.set_status_sig.emit("Предупреждение аудиопотока")
         self._update_audio_level(indata)
         with self.frames_lock:
             self.frames.append(indata.copy())
@@ -2527,7 +2721,7 @@ class ModernMeetingHelperGui(QWidget):
 
     def system_audio_callback(self, indata, frames, time_info, status):
         if status:
-            QTimer.singleShot(0, lambda: self.set_status("Звук системы нестабилен"))
+            _bridge.set_status_sig.emit("Звук системы нестабилен")
         self._update_audio_level(indata)
         with self.system_frames_lock:
             self.system_frames.append(indata.copy())
@@ -2556,22 +2750,29 @@ class ModernMeetingHelperGui(QWidget):
             input_device_index=device_index,
             frames_per_buffer=1024,
         )
-        threading.Thread(
+        self._system_reader_thread = threading.Thread(
             target=self._system_audio_reader,
-            args=(channels, source_rate),
+            args=(channels, source_rate, self.system_stream, self._recording_stop),
             daemon=True,
-        ).start()
+        )
+        self._system_reader_thread.start()
 
-    def _system_audio_reader(self, channels, source_rate):
-        while self.is_recording and self.system_stream is not None:
+    def _system_audio_reader(self, channels, source_rate, stream, stop_event):
+        while not stop_event.is_set():
             try:
-                data = self.system_stream.read(1024, exception_on_overflow=False)
+                # Never block in read while the UI is waiting to close WASAPI.
+                available = stream.get_read_available()
+                if available <= 0:
+                    stop_event.wait(0.01)
+                    continue
+                data = stream.read(min(1024, available), exception_on_overflow=False)
                 chunk = np.frombuffer(data, dtype=np.int16).reshape(-1, channels)
                 chunk = resample_audio(chunk, source_rate, SAMPLE_RATE)
                 chunk = np.asarray(chunk, dtype=np.int16)
                 self.system_audio_seen = True
                 peak = int(np.max(np.abs(chunk))) if chunk.size else 0
                 if peak > 120:
+                    self._sys_signal_at = time.monotonic()
                     self.system_audio_has_signal = True
                     if not self._system_status_reported:
                         self._system_status_reported = True
@@ -2581,8 +2782,52 @@ class ModernMeetingHelperGui(QWidget):
                     self.system_frames.append(chunk.copy())
                     self.full_system_frames.append(chunk.copy())
             except Exception as exc:
+                self.system_audio_active = False
                 _bridge.set_status_sig.emit(f"Звук системы недоступен: {str(exc)[:70]}")
                 break
+
+    def _close_audio_streams(self):
+        stop_event = getattr(self, "_recording_stop", None)
+        if stop_event is not None:
+            stop_event.set()
+        reader = getattr(self, "_system_reader_thread", None)
+        if reader is not None:
+            reader.join(timeout=3)
+            if reader.is_alive():
+                raise RuntimeError("системный аудиопоток ещё завершается; повторите остановку")
+            self._system_reader_thread = None
+        # No PortAudio read may remain in flight before close/terminate.
+        errors = []
+        for attr, stop_method in (("stream", "stop"), ("system_stream", "stop_stream")):
+            stream = getattr(self, attr, None)
+            if stream is not None:
+                try:
+                    getattr(stream, stop_method)()
+                    stream.close()
+                    setattr(self, attr, None)
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+        if self.system_pa is not None and self.system_stream is None:
+            self.system_pa.terminate()
+            self.system_pa = None
+        self.system_audio_active = False
+        if errors:
+            raise RuntimeError("не удалось освободить аудиопоток: " + ", ".join(errors))
+
+    def _refresh_source_indicators(self):
+        now = time.monotonic()
+        for label, name, active, last_signal in (
+            (self.mic_indicator, "MIC", self.is_recording and self.stream is not None,
+             getattr(self, "_mic_signal_at", 0.0)),
+            (self.sys_indicator, "SYS", self.is_recording and self.system_audio_active,
+             getattr(self, "_sys_signal_at", 0.0)),
+        ):
+            state = "Выключен" if not active else (
+                "Есть сигнал" if last_signal > 0 and now - last_signal < 1.0 else "Поток открыт"
+            )
+            label.setText(f"{name} · {state}")
+            color = GREEN if active and state == "Есть сигнал" else CYAN if active else MUTED
+            label.setStyleSheet(f"color: {color.name()}; background: transparent;")
 
     def _update_audio_level(self, indata):
         try:
@@ -2595,32 +2840,20 @@ class ModernMeetingHelperGui(QWidget):
 
     def stop_recording(self):
         self.is_recording = False
+        self.toggle.setEnabled(True)
         was_system_audio_active = self.system_audio_active
         self.listen_btn.configure(
-            text="◉  Запись",
+            text="Запись",
             fg_color=CYAN_DIM,
             border_color=CYAN,
         )
         self.audio_level = 0.0
 
         try:
-            if self.stream is not None:
-                self.stream.stop(); self.stream.close()
-            if self.system_stream is not None:
-                self.system_stream.stop_stream(); self.system_stream.close()
+            self._close_audio_streams()
         except Exception as exc:
             self.set_error(f"не удалось остановить запись: {exc}")
             return
-        finally:
-            self.stream = None
-            self.system_stream = None
-            if self.system_pa is not None:
-                try:
-                    self.system_pa.terminate()
-                except Exception:
-                    pass
-            self.system_pa = None
-            self.system_audio_active = False
 
         with self.frames_lock:
             frames = list(self.frames)
@@ -2644,7 +2877,7 @@ class ModernMeetingHelperGui(QWidget):
                 audio = self._mix_frames(full_frames, full_system_frames)
                 if audio is not None:
                     threading.Thread(target=self._live_final_worker,
-                                     args=(audio,), daemon=True).start()
+                                     args=(audio, self._recording_id), daemon=True).start()
             return
 
         # ── Normal mode: transcribe everything at once ─────────────────────────────
@@ -2657,27 +2890,26 @@ class ModernMeetingHelperGui(QWidget):
             self.set_status("Ничего не распознано")
             return
         self.set_status("Распознаю...")
-        threading.Thread(target=self._transcribe_worker, args=(audio,), daemon=True).start()
+        threading.Thread(target=self._transcribe_worker, args=(audio, self._recording_id), daemon=True).start()
 
     def _mix_frames(self, frames, system_frames):
         """Mix mic and system frame lists into a single int16 array, or None if empty."""
         tracks = []
-        if frames:
+        system_enabled = self.settings.get("system_audio_enabled", False)
+        mix_sources = self.settings.get("mix_mic_and_system_audio", True)
+        if frames and (not system_enabled or mix_sources):
             tracks.append(np.concatenate(frames, axis=0))
-        if system_frames and (
-            self.settings.get("mix_mic_and_system_audio", True) or not frames
-        ):
+        if system_frames and system_enabled:
             tracks.append(np.concatenate(system_frames, axis=0))
         return mix_audio_tracks(tracks) if tracks else None
 
     # ── Transcription ─────────────────────────────────────────────────────────
 
-    def _live_transcription_worker(self):
+    def _live_transcription_worker(self, recording_id, stop_event):
         """Background loop: grab a chunk every N seconds and send to Whisper."""
         chunk_sec = max(1, self.settings.get("live_chunk_seconds", 2))
-        while self.is_recording:
-            time.sleep(chunk_sec)
-            if not self.is_recording:
+        while not stop_event.wait(chunk_sec):
+            if stop_event.is_set():
                 break
             with self.frames_lock:
                 frames = list(self.frames)
@@ -2694,12 +2926,27 @@ class ModernMeetingHelperGui(QWidget):
             try:
                 raw_response, text = self.transcribe_audio_with_raw(audio)
             except Exception as exc:
-                _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
+                log_whisper_diagnostic(
+                    self.settings.get("diagnostic_mode", False),
+                    "whisper_live_error",
+                    error_type=type(exc).__name__,
+                )
+                if not stop_event.is_set():
+                    _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
                 continue
 
+            if stop_event.is_set() or recording_id != self._recording_id:
+                return
             cleaned = _clean_live_transcription_text(text)
             merged = merge_transcription_chunks(self._last_live_text, cleaned)
-            log_live_whisper_debug(raw_response, text, cleaned, merged)
+            log_whisper_diagnostic(
+                self.settings.get("diagnostic_mode", False),
+                "whisper_live_chunk",
+                raw_bytes=len(raw_response.encode("utf-8")),
+                extracted_chars=len(text),
+                cleaned_chars=len(cleaned),
+                merged_chars=len(merged),
+            )
             if merged == self._last_live_text:
                 if self.is_recording:
                     _bridge.set_status_sig.emit("Слушаю...")
@@ -2709,13 +2956,21 @@ class ModernMeetingHelperGui(QWidget):
             _bridge.append_question_sig.emit(merged)
             _bridge.set_status_sig.emit("Промежуточный текст")
 
-    def _live_final_worker(self, audio):
+    def _live_final_worker(self, audio, recording_id):
         """Transcribe the full recording after Stop and replace the live preview."""
         _bridge.set_status_sig.emit("Распознаю...")
         try:
             text = self.transcribe_audio(audio)
         except Exception as exc:
-            _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
+            log_whisper_diagnostic(
+                self.settings.get("diagnostic_mode", False),
+                "whisper_final_error",
+                error_type=type(exc).__name__,
+            )
+            if recording_id == self._recording_id:
+                _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
+            return
+        if recording_id != self._recording_id:
             return
         if not text:
             _bridge.set_status_sig.emit("Ничего не распознано")
@@ -2724,11 +2979,19 @@ class ModernMeetingHelperGui(QWidget):
         _bridge.set_question_sig.emit(text)
         _bridge.set_status_sig.emit("Финальный текст готов")
 
-    def _transcribe_worker(self, audio):
+    def _transcribe_worker(self, audio, recording_id):
         try:
             text = self.transcribe_audio(audio)
         except Exception as exc:
-            _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
+            log_whisper_diagnostic(
+                self.settings.get("diagnostic_mode", False),
+                "whisper_error",
+                error_type=type(exc).__name__,
+            )
+            if recording_id == self._recording_id:
+                _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
+            return
+        if recording_id != self._recording_id:
             return
         if not text:
             _bridge.set_status_sig.emit("Ничего не распознано")
@@ -2763,7 +3026,10 @@ class ModernMeetingHelperGui(QWidget):
 
     def _set_question_text(self, text: str):
         self.question_box.setPlainText(text)
-        append_line("transcript.txt", text)
+        try:
+            save_history_entry(self.settings, "transcript.txt", text)
+        except OSError:
+            self.set_error("не удалось сохранить локальную историю")
 
     def _set_answer_text(self, text: str):
         self.answer_box.setPlainText(text)
@@ -2892,7 +3158,7 @@ class ModernMeetingHelperGui(QWidget):
             _bridge.set_status_sig.emit(f"Ошибка: {str(exc)[:90]}")
             return
         self.conversation_history.add_exchange(question, answer)
-        append_line("suggestions.txt", answer)
+        save_history_entry(self.settings, "suggestions.txt", answer)
         _bridge.set_answer_sig.emit(answer)
         _bridge.set_status_sig.emit("Ответ получен")
         QTimer.singleShot(0, self._refresh_mode_label)
@@ -2914,8 +3180,13 @@ class ModernMeetingHelperGui(QWidget):
             response.raise_for_status()
         except requests.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else "unknown"
-            body = exc.response.text if exc.response is not None else ""
-            raise RuntimeError(f"LLM HTTP {code}: {body[:300]}") from exc
+            if code == 404:
+                detail = "Проверьте URL и модель. В Open WebUI очистите chat_id."
+            elif code in (401, 403):
+                detail = "Проверьте API-ключ и права доступа к модели."
+            else:
+                detail = "Сервер не выполнил запрос. Проверьте настройки LLM и доступность сервиса."
+            raise RuntimeError(f"LLM HTTP {code}. {detail}") from exc
         except requests.RequestException as exc:
             raise RuntimeError(f"ошибка подключения к LLM: {exc}") from exc
         try:
@@ -2935,21 +3206,11 @@ class ModernMeetingHelperGui(QWidget):
 
     def on_close(self):
         self.is_recording = False
-        if self.stream is not None:
-            try:
-                self.stream.stop(); self.stream.close()
-            except Exception:
-                pass
-        if self.system_stream is not None:
-            try:
-                self.system_stream.stop_stream(); self.system_stream.close()
-            except Exception:
-                pass
-        if self.system_pa is not None:
-            try:
-                self.system_pa.terminate()
-            except Exception:
-                pass
+        self._recording_id = getattr(self, "_recording_id", 0) + 1
+        try:
+            self._close_audio_streams()
+        except Exception:
+            pass
 
 
 def main():
@@ -2961,6 +3222,7 @@ def main():
             pass
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
+    app.setFont(QFont(system_font_family(), 10))
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))

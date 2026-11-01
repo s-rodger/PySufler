@@ -24,8 +24,8 @@ except ImportError:
 
 
 PROMPT = (
-    "Ты помощник Дениса на рабочем совещании. По фрагменту разговора дай "
-    "короткий готовый ответ от лица Дениса. Если данных недостаточно - скажи, "
+    "Ты помощник пользователя на рабочем совещании. По фрагменту разговора дай "
+    "короткий готовый ответ от лица пользователя. Если данных недостаточно - скажи, "
     "что нужно уточнить. Не выдумывай факты."
 )
 
@@ -206,6 +206,13 @@ def append_line(path, text):
     target = data_path(path) if not os.path.isabs(str(path)) else path
     with open(target, "a", encoding="utf-8") as file:
         file.write(f"[{timestamp}] {text}\n")
+
+
+def save_history_entry(settings, path, text):
+    if not settings.get("save_history", False):
+        return False
+    append_line(path, text)
+    return True
 
 
 def audio_to_wav_bytes(audio, sample_rate):
@@ -503,7 +510,11 @@ def build_llm_request(settings, transcript_text, history: list | None = None):
         }
         if llm_api_type == "openwebui":
             payload["stream"] = False
-            payload["chat_id"] = settings["openwebui_chat_id"]
+            # Standalone completions do not need a persisted Open WebUI chat.
+            # The former default was a label, not an existing server chat ID.
+            chat_id = str(settings.get("openwebui_chat_id") or "").strip()
+            if chat_id and chat_id != "meeting-helper":
+                payload["chat_id"] = chat_id
             payload["max_tokens"] = max_tokens
         return payload
 
@@ -595,8 +606,8 @@ def request_suggestion(settings, transcript_text):
     print("\n=== Подсказка ===")
     print(suggestion)
     print("=================\n")
-    append_line("suggestions.txt", suggestion)
-    print("Подсказка сохранена в suggestions.txt")
+    if save_history_entry(settings, "suggestions.txt", suggestion):
+        print("Подсказка сохранена в suggestions.txt")
 
 
 def listen_loop(settings, buffer, stop_event):
@@ -623,7 +634,7 @@ def listen_loop(settings, buffer, stop_event):
         text = transcribe_chunk(settings, audio, sample_rate)
         if text:
             print(f"> {text}")
-            append_line("transcript.txt", text)
+            save_history_entry(settings, "transcript.txt", text)
             buffer.add(text)
 
 

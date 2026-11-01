@@ -3,6 +3,7 @@
 .env.*
 !/.env.example
 config.json
+secrets.json
 *.key
 *.pem
 
